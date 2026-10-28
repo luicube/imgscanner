@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Picture Scanner</title>
+  <style>
+    :root { --c: #5eead4; --bg: rgba(8, 20, 24, .85); }
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+                 font-family: "Courier New", monospace; color: var(--c); }
+    video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    .panel { position: fixed; left: 12px; right: 12px; background: var(--bg);
+             border: 1px solid var(--c); padding: 10px 12px; font-size: 13px; z-index: 5; }
+    #top { top: 12px; letter-spacing: 2px; font-weight: bold; }
+    #top small { display: block; font-weight: normal; opacity: .7; letter-spacing: 0; }
+    #bottom { bottom: 12px; text-align: center; }
+    #status { letter-spacing: 2px; font-weight: bold; }
+    #bar { height: 4px; background: #5eead433; margin-top: 8px; }
+    #bar i { display: block; height: 100%; width: 0; background: var(--c);
+             transition: width .2s; }
+    #scan { position: fixed; left: 0; right: 0; height: 3px; background: var(--c);
+            box-shadow: 0 0 14px var(--c); z-index: 4;
+            animation: sweep 2.2s linear infinite alternate; }
+    @keyframes sweep { from { top: 15%; } to { top: 75%; } }
+    #go { display: none; margin-top: 10px; padding: 10px; background: var(--c);
+          color: #042f2e; font-weight: bold; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <video id="cam" playsinline muted autoplay></video>
+  <canvas id="work" hidden></canvas>
+  <div id="scan"></div>
+
+  <div id="top" class="panel">PICTURE SCANNER
+    <small>FEATURE MATCHING // ORB + RANSAC</small>
+  </div>
+
+  <div id="bottom" class="panel">
+    <div id="status">MEMUAT SISTEM...</div>
+    <div id="bar"><i></i></div>
+    <a id="go" href="#">BUKA LINK</a>
+  </div>
+
+  <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="cvLoaded()"></script>
+
+  <script>
+    // ====== UBAH DI SINI ======
+    const CONFIG = {
+      url: "https:/my-cool-portofolio.vercel.app",   // web tujuan
+      targetImage: "target.jpg",    // gambar yang discan
+      minInliers: 15,               // makin kecil = makin gampang cocok (10-25)
+      framesNeeded: 3,              // berapa kali berturut-turut harus cocok
+      intervalMs: 250,              // jeda antar pengecekan
+      scanWidth: 480                // lebar frame yang dianalisis
+    };
+    // ==========================
+
+    const $ = (s) => document.querySelector(s);
+    const video = $("#cam"), work = $("#work");
+    const setStatus = (t) => ($("#status").textContent = t);
+
+    function cvLoaded() {
+      if (cv.Mat) start();
+      else if (cv.then) cv.then((m) => { window.cv = m; start(); });
+      else cv.onRuntimeInitialized = start;
+    }
+
+    async function start() {
+      try {
+        setStatus("MEMUAT GAMBAR TARGET...");
+        const img = await loadImage(CONFIG.targetImage);
+
+        const tc = document.createElement("canvas");
+        const sc = Math.min(1, 640 / img.width);
+        tc.width = img.width * sc; tc.height = img.height * sc;
+        tc.getContext("2d").drawImage(img, 0, 0, tc.width, tc.height);
+        const tSrc = cv.imread(tc), tGray = new cv.Mat();
+        cv.cvtColor(tSrc, tGray, cv.COLOR_RGBA2GRAY);
+        const orb = new cv.ORB(1000);
+        const tKp = new cv.KeyPointVector(), tDes = new cv.Mat();
+        orb.detectAndCompute(tGray, new cv.Mat(), tKp, tDes);
+        tSrc.delete(); tGray.delete();
+        if (tKp.size() < 20) {
+          setStatus("GAMBAR TARGET KURANG DETAIL"); return;
+        }
+
+        setStatus("MENYALAKAN KAMERA...");
+        video.srcObject = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment", width: { ideal: 1280 } }, audio: false
+        });
+        await video.play();
+
+        const matcher = new cv.BFMatcher(cv.NORM_HAMMING, false);
+        let hits = 0, done = false;
+        setStatus("ARAHKAN KAMERA KE GAMBAR");
+
+        function tick() {
+          if (done) return;
+          const inl = analyzeFrame(orb, matcher, tKp, tDes);
+          if (inl >= CONFIG.minInliers) hits++; else hits = Math.max(0, hits - 1);
+          $("#bar i").style.width = Math.min(100, (hits / CONFIG.framesNeeded) * 100) + "%";
+          if (inl >= 0) setStatus((hits ? "MENGANALISIS... " : "SCANNING... ") + "(" + inl + ")");
+
+          if (hits >= CONFIG.framesNeeded) {
+            done = true;
+            $("#scan").style.display = "none";
+            setStatus("MATCH FOUND");
+            const go = $("#go"); go.href = CONFIG.url; go.style.display = "block";
+            setTimeout(() => (location.href = CONFIG.url), 1000);
+            return;
+          }
+          setTimeout(tick, CONFIG.intervalMs);
+        }
+        tick();
+      } catch (e) {
+        console.error(e);
+        setStatus("ERROR: " + (e.message || e));
+      }
+    }
+
+    function analyzeFrame(orb, matcher, tKp, tDes) {
+      if (!video.videoWidth) return -1;
+      const w = CONFIG.scanWidth, h = Math.round(w * video.videoHeight / video.videoWidth);
+      work.width = w; work.height = h;
+      work.getContext("2d").drawImage(video, 0, 0, w, h);
+
+      const src = cv.imread(work), gray = new cv.Mat();
+      const fKp = new cv.KeyPointVector(), fDes = new cv.Mat();
+      const matches = new cv.DMatchVectorVector();
+      let inliers = 0;
+      try {
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        orb.detectAndCompute(gray, new cv.Mat(), fKp, fDes);
+        if (fDes.rows < 10) return 0;
+
+        matcher.knnMatch(tDes, fDes, matches, 2);
+        const good = [];
+        for (let i = 0; i < matches.size(); i++) {
+          const m = matches.get(i);
+          if (m.size() >= 2) {
+            const a = m.get(0), b = m.get(1);
+            if (a.distance < 0.75 * b.distance) good.push(a);
+          }
+          m.delete();
+        }
+        if (good.length < 8) return 0;
+
+        const s = [], d = [];
+        for (const g of good) {
+          const p1 = tKp.get(g.queryIdx).pt, p2 = fKp.get(g.trainIdx).pt;
+          s.push(p1.x, p1.y); d.push(p2.x, p2.y);
+        }
+        const sm = cv.matFromArray(good.length, 1, cv.CV_32FC2, s);
+        const dm = cv.matFromArray(good.length, 1, cv.CV_32FC2, d);
+        const mask = new cv.Mat();
+        const H = cv.findHomography(sm, dm, cv.RANSAC, 5.0, mask);
+        if (!H.empty()) {
+          for (let i = 0; i < mask.rows; i++) if (mask.data[i]) inliers++;
+        }
+        sm.delete(); dm.delete(); mask.delete(); H.delete();
+      } finally {
+        src.delete(); gray.delete(); fKp.delete(); fDes.delete(); matches.delete();
+      }
+      return inliers;
+    }
+
+    function loadImage(url) {
+      return new Promise((res, rej) => {
+        const i = new Image();
+        i.onload = () => res(i);
+        i.onerror = () => rej(new Error("target.jpg tidak ditemukan"));
+        i.src = url;
+      });
+    }
+  </script>
+</body>
+</html>
