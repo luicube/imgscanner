@@ -46,12 +46,16 @@
   <script>
     // ====== UBAH DI SINI ======
     const CONFIG = {
-      url: "https://my-cool-portofolio.vercel.app",   // web tujuan
-      targetImage: "target.jpg",    // gambar yang discan
-      minInliers: 15,               // makin kecil = makin gampang cocok (10-25)
-      framesNeeded: 3,              // berapa kali berturut-turut harus cocok
-      intervalMs: 250,              // jeda antar pengecekan
-      scanWidth: 480                // lebar frame yang dianalisis
+      targets: [
+        { image: "target1.jpg", url: "https://my-cool-portofolio.vercel.app" },
+        { image: "target2.jpg", url: "https://m.youtube.com/@luimiawch" },
+        { image: "target3.jpg", url: "https://wikipedia.org" }
+        // tambah baris baru untuk gambar lain
+      ],
+      minInliers: 15,     // makin kecil = makin gampang cocok (10-25)
+      framesNeeded: 3,    // berapa kali berturut-turut harus cocok
+      intervalMs: 300,    // jeda antar pengecekan
+      scanWidth: 480      // lebar frame yang dianalisis
     };
     // ==========================
 
@@ -67,21 +71,24 @@
 
     async function start() {
       try {
-        setStatus("MEMUAT GAMBAR TARGET...");
-        const img = await loadImage(CONFIG.targetImage);
-
-        const tc = document.createElement("canvas");
-        const sc = Math.min(1, 640 / img.width);
-        tc.width = img.width * sc; tc.height = img.height * sc;
-        tc.getContext("2d").drawImage(img, 0, 0, tc.width, tc.height);
-        const tSrc = cv.imread(tc), tGray = new cv.Mat();
-        cv.cvtColor(tSrc, tGray, cv.COLOR_RGBA2GRAY);
         const orb = new cv.ORB(1000);
-        const tKp = new cv.KeyPointVector(), tDes = new cv.Mat();
-        orb.detectAndCompute(tGray, new cv.Mat(), tKp, tDes);
-        tSrc.delete(); tGray.delete();
-        if (tKp.size() < 20) {
-          setStatus("GAMBAR TARGET KURANG DETAIL"); return;
+        const targets = [];
+
+        for (let n = 0; n < CONFIG.targets.length; n++) {
+          const t = CONFIG.targets[n];
+          setStatus("MEMUAT TARGET " + (n + 1) + "/" + CONFIG.targets.length + "...");
+          const img = await loadImage(t.image);
+          const tc = document.createElement("canvas");
+          const sc = Math.min(1, 640 / img.width);
+          tc.width = img.width * sc; tc.height = img.height * sc;
+          tc.getContext("2d").drawImage(img, 0, 0, tc.width, tc.height);
+          const src = cv.imread(tc), gray = new cv.Mat();
+          cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+          const kp = new cv.KeyPointVector(), des = new cv.Mat();
+          orb.detectAndCompute(gray, new cv.Mat(), kp, des);
+          src.delete(); gray.delete();
+          if (kp.size() < 20) throw new Error(t.image + " kurang detail");
+          targets.push({ kp, des, url: t.url });
         }
 
         setStatus("MENYALAKAN KAMERA...");
@@ -91,23 +98,28 @@
         await video.play();
 
         const matcher = new cv.BFMatcher(cv.NORM_HAMMING, false);
-        let hits = 0, done = false;
+        let hits = 0, lastIdx = -1, done = false;
         setStatus("ARAHKAN KAMERA KE GAMBAR");
 
         function tick() {
           if (done) return;
-          const inl = analyzeFrame(orb, matcher, tKp, tDes);
-          if (inl >= CONFIG.minInliers) hits++; else hits = Math.max(0, hits - 1);
-          $("#bar i").style.width = Math.min(100, (hits / CONFIG.framesNeeded) * 100) + "%";
-          if (inl >= 0) setStatus((hits ? "MENGANALISIS... " : "SCANNING... ") + "(" + inl + ")");
+          const r = analyzeFrame(orb, matcher, targets);
+          if (r) {
+            if (r.inl >= CONFIG.minInliers) {
+              if (r.idx === lastIdx) hits++; else { lastIdx = r.idx; hits = 1; }
+            } else hits = Math.max(0, hits - 1);
+            $("#bar i").style.width = Math.min(100, (hits / CONFIG.framesNeeded) * 100) + "%";
+            setStatus((hits ? "MENGANALISIS... " : "SCANNING... ") + "(" + r.inl + ")");
 
-          if (hits >= CONFIG.framesNeeded) {
-            done = true;
-            $("#scan").style.display = "none";
-            setStatus("MATCH FOUND");
-            const go = $("#go"); go.href = CONFIG.url; go.style.display = "block";
-            setTimeout(() => (location.href = CONFIG.url), 1000);
-            return;
+            if (hits >= CONFIG.framesNeeded) {
+              done = true;
+              const url = targets[lastIdx].url;
+              $("#scan").style.display = "none";
+              setStatus("MATCH FOUND #" + (lastIdx + 1));
+              const go = $("#go"); go.href = url; go.style.display = "block";
+              setTimeout(() => (location.href = url), 1000);
+              return;
+            }
           }
           setTimeout(tick, CONFIG.intervalMs);
         }
@@ -118,22 +130,36 @@
       }
     }
 
-    function analyzeFrame(orb, matcher, tKp, tDes) {
-      if (!video.videoWidth) return -1;
+    // Mengembalikan target dengan kecocokan terbaik: { idx, inl }
+    function analyzeFrame(orb, matcher, targets) {
+      if (!video.videoWidth) return null;
       const w = CONFIG.scanWidth, h = Math.round(w * video.videoHeight / video.videoWidth);
       work.width = w; work.height = h;
       work.getContext("2d").drawImage(video, 0, 0, w, h);
 
       const src = cv.imread(work), gray = new cv.Mat();
       const fKp = new cv.KeyPointVector(), fDes = new cv.Mat();
-      const matches = new cv.DMatchVectorVector();
-      let inliers = 0;
+      let best = { idx: -1, inl: 0 };
       try {
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
         orb.detectAndCompute(gray, new cv.Mat(), fKp, fDes);
-        if (fDes.rows < 10) return 0;
+        if (fDes.rows < 10) return best;
 
-        matcher.knnMatch(tDes, fDes, matches, 2);
+        targets.forEach((t, idx) => {
+          const inl = matchTarget(matcher, t, fKp, fDes);
+          if (inl > best.inl) best = { idx, inl };
+        });
+      } finally {
+        src.delete(); gray.delete(); fKp.delete(); fDes.delete();
+      }
+      return best;
+    }
+
+    function matchTarget(matcher, t, fKp, fDes) {
+      const matches = new cv.DMatchVectorVector();
+      let inliers = 0;
+      try {
+        matcher.knnMatch(t.des, fDes, matches, 2);
         const good = [];
         for (let i = 0; i < matches.size(); i++) {
           const m = matches.get(i);
@@ -147,7 +173,7 @@
 
         const s = [], d = [];
         for (const g of good) {
-          const p1 = tKp.get(g.queryIdx).pt, p2 = fKp.get(g.trainIdx).pt;
+          const p1 = t.kp.get(g.queryIdx).pt, p2 = fKp.get(g.trainIdx).pt;
           s.push(p1.x, p1.y); d.push(p2.x, p2.y);
         }
         const sm = cv.matFromArray(good.length, 1, cv.CV_32FC2, s);
@@ -159,7 +185,7 @@
         }
         sm.delete(); dm.delete(); mask.delete(); H.delete();
       } finally {
-        src.delete(); gray.delete(); fKp.delete(); fDes.delete(); matches.delete();
+        matches.delete();
       }
       return inliers;
     }
@@ -168,7 +194,7 @@
       return new Promise((res, rej) => {
         const i = new Image();
         i.onload = () => res(i);
-        i.onerror = () => rej(new Error("target.jpg tidak ditemukan"));
+        i.onerror = () => rej(new Error(url + " tidak ditemukan"));
         i.src = url;
       });
     }
